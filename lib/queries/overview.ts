@@ -1,5 +1,5 @@
-import { and, eq, sql, gte, lte, desc } from "drizzle-orm";
-import type { SQL } from "drizzle-orm";
+import * as DrizzleOrm from "drizzle-orm";
+const { and, eq, sql, gte, lte, desc } = DrizzleOrm as any;
 import { db } from "@/lib/db/client";
 import { authFileMappings, modelPrices, usageRecords } from "@/lib/db/schema";
 import type { UsageOverview, ModelUsage, UsageSeriesPoint } from "@/lib/types";
@@ -97,11 +97,11 @@ export async function getOverview(
   const since = hasCustomRange ? withDayStart(startDate!) : new Date(Date.now() - days * DAY_MS);
   const until = hasCustomRange ? withDayEnd(endDate!) : undefined;
 
-  const baseWhereParts: SQL[] = [gte(usageRecords.occurredAt, since)];
+  const baseWhereParts: any[] = [gte(usageRecords.occurredAt, since)];
   if (until) baseWhereParts.push(lte(usageRecords.occurredAt, until));
   const baseWhere = baseWhereParts.length ? and(...baseWhereParts) : undefined;
 
-  const filterWhereParts: SQL[] = [...baseWhereParts];
+  const filterWhereParts: any[] = [...baseWhereParts];
   if (opts?.model) filterWhereParts.push(eq(usageRecords.model, opts.model));
   if (opts?.route) filterWhereParts.push(eq(usageRecords.route, opts.route));
   if (opts?.source) filterWhereParts.push(eq(usageRecords.source, opts.source));

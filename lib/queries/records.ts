@@ -1,5 +1,5 @@
-import { and, asc, desc, eq, gte, lte, sql } from "drizzle-orm";
-import type { SQL } from "drizzle-orm";
+import * as DrizzleOrm from "drizzle-orm";
+const { and, asc, desc, eq, gte, lte, sql } = DrizzleOrm as any;
 import { db } from "@/lib/db/client";
 import { authFileMappings, modelPrices, usageRecords } from "@/lib/db/schema";
 
@@ -100,8 +100,8 @@ function buildCursorWhere(
   sortField: SortField,
   sortOrder: SortOrder,
   cursor: UsageRecordCursor | null,
-  sortExpr: SQL
-): SQL | undefined {
+  sortExpr: any
+): any {
   if (!cursor) return undefined;
 
   const { lastValue, lastId } = cursor;
@@ -136,7 +136,7 @@ export async function getUsageRecords(input: {
   const sortOrder: SortOrder = input.sortOrder ?? "desc";
   const cursor = parseCursor(input.cursor ?? null);
 
-  const whereParts: SQL[] = [];
+  const whereParts: any[] = [];
 
   if (input.start) {
     const startDate = new Date(input.start);
@@ -190,7 +190,7 @@ export async function getUsageRecords(input: {
       default:
         return usageRecords.occurredAt;
     }
-  })() as SQL;
+  })() as any;
 
   const cursorWhere = buildCursorWhere(sortField, sortOrder, cursor, sortExpr);
   if (cursorWhere) whereParts.push(cursorWhere);
@@ -223,7 +223,7 @@ export async function getUsageRecords(input: {
     )
     .limit(limit + 1);
 
-  const rows = await query;
+  const rows: UsageRecordRow[] = await query;
 
   const hasMore = rows.length > limit;
   const items = hasMore ? rows.slice(0, limit) : rows;
@@ -265,7 +265,11 @@ export async function getUsageRecords(input: {
 
   let filters: { models: string[]; routes: string[]; sources: string[] } | undefined;
   if (input.includeFilters) {
-    const [modelRows, routeRows, sourceRows] = await Promise.all([
+    const [modelRows, routeRows, sourceRows]: [
+      Array<{ model: string }>,
+      Array<{ route: string }>,
+      Array<{ source: string }>
+    ] = await Promise.all([
       db
         .select({ model: usageRecords.model })
         .from(usageRecords)

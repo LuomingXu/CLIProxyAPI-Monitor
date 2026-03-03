@@ -72,7 +72,8 @@ export async function POST(request: Request) {
   }
 }
 
-import { eq } from "drizzle-orm";
+import * as DrizzleOrm from "drizzle-orm";
+const { eq } = DrizzleOrm as any;
 
 const deleteSchema = z.object({
   model: z.string().min(1)
