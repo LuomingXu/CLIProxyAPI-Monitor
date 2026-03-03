@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { eq, sql } from "drizzle-orm";
+import * as nextHeaders from "next/headers";
+import * as DrizzleOrm from "drizzle-orm";
 import { config, assertEnv } from "@/lib/config";
 import { db } from "@/lib/db/client";
 import { authFileMappings, usageRecords } from "@/lib/db/schema";
 import { toAuthFileMappings } from "@/lib/auth-files";
 import { parseUsagePayload, toUsageRecords } from "@/lib/usage";
+
+const { eq, sql } = DrizzleOrm as any;
 
 export const runtime = "nodejs";
 
@@ -13,6 +15,25 @@ const PASSWORD = process.env.PASSWORD || process.env.CLIPROXY_SECRET_KEY || "";
 const COOKIE_NAME = "dashboard_auth";
 const AUTH_FILES_TIMEOUT_MS = 15_000;
 const USAGE_TIMEOUT_MS = 60_000;
+
+function toPositiveInt(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (Number.isNaN(value) || value <= 0) return fallback;
+  return value;
+}
+
+const AUTH_FILES_INSERT_CHUNK_SIZE = toPositiveInt(process.env.AUTH_FILES_INSERT_CHUNK_SIZE, 500);
+const USAGE_INSERT_CHUNK_SIZE = toPositiveInt(process.env.USAGE_INSERT_CHUNK_SIZE, 1000);
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  if (items.length === 0) return [];
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
 
 function unauthorized() {
   return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -53,7 +74,7 @@ async function isAuthorized(request: Request) {
   
   // 检查用户的 dashboard cookie（用于前端调用）
   if (PASSWORD) {
-    const cookieStore = await cookies();
+    const cookieStore = await (nextHeaders as any).cookies();
     const authCookie = cookieStore.get(COOKIE_NAME);
     if (authCookie) {
       const expectedToken = await hashPassword(PASSWORD);
@@ -83,21 +104,23 @@ async function syncAuthFileMappings(pulledAt: Date) {
   const rows = toAuthFileMappings(json, pulledAt);
   if (rows.length === 0) return 0;
 
-  await db
-    .insert(authFileMappings)
-    .values(rows)
-    .onConflictDoUpdate({
-      target: authFileMappings.authId,
-      set: {
-        name: sql`coalesce(nullif(excluded.name, ''), ${authFileMappings.name})`,
-        label: sql`coalesce(nullif(excluded.label, ''), ${authFileMappings.label})`,
-        provider: sql`coalesce(nullif(excluded.provider, ''), ${authFileMappings.provider})`,
-        source: sql`coalesce(nullif(excluded.source, ''), ${authFileMappings.source})`,
-        email: sql`coalesce(nullif(excluded.email, ''), ${authFileMappings.email})`,
-        updatedAt: sql`coalesce(excluded.updated_at, ${authFileMappings.updatedAt})`,
-        syncedAt: pulledAt
-      }
-    });
+  for (const chunk of chunkArray(rows, AUTH_FILES_INSERT_CHUNK_SIZE)) {
+    await db
+      .insert(authFileMappings)
+      .values(chunk)
+      .onConflictDoUpdate({
+        target: authFileMappings.authId,
+        set: {
+          name: sql`coalesce(nullif(excluded.name, ''), ${authFileMappings.name})`,
+          label: sql`coalesce(nullif(excluded.label, ''), ${authFileMappings.label})`,
+          provider: sql`coalesce(nullif(excluded.provider, ''), ${authFileMappings.provider})`,
+          source: sql`coalesce(nullif(excluded.source, ''), ${authFileMappings.source})`,
+          email: sql`coalesce(nullif(excluded.email, ''), ${authFileMappings.email})`,
+          updatedAt: sql`coalesce(excluded.updated_at, ${authFileMappings.updatedAt})`,
+          syncedAt: pulledAt
+        }
+      });
+  }
 
   return rows.length;
 }
@@ -180,13 +203,16 @@ async function performSync(request: Request) {
     });
   }
 
-  let insertedRows: Array<{ id: number }>;
+  let inserted = 0;
   try {
-    insertedRows = await db
-      .insert(usageRecords)
-      .values(rows)
-      .onConflictDoNothing({ target: [usageRecords.occurredAt, usageRecords.route, usageRecords.model, usageRecords.source] })
-      .returning({ id: usageRecords.id });
+    for (const chunk of chunkArray(rows, USAGE_INSERT_CHUNK_SIZE)) {
+      const insertedRows = await db
+        .insert(usageRecords)
+        .values(chunk)
+        .onConflictDoNothing({ target: [usageRecords.occurredAt, usageRecords.route, usageRecords.model, usageRecords.source] })
+        .returning({ id: usageRecords.id });
+      inserted += insertedRows.length;
+    }
   } catch (dbError) {
     console.error("/api/sync database insert failed:", dbError);
     return NextResponse.json(
@@ -197,7 +223,6 @@ async function performSync(request: Request) {
 
   // Vercel Postgres may return an empty array even when rows are inserted with RETURNING + ON CONFLICT DO NOTHING.
   // Fall back to counting rows synced in this run (identified by the shared pulledAt timestamp) to avoid reporting 0.
-  let inserted = insertedRows.length;
   if (inserted === 0 && rows.length > 0) {
     const fallback = await db
       .select({ count: sql<number>`count(*)` })

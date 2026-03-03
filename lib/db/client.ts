@@ -28,6 +28,21 @@ const PG_SSL_QUERY_KEYS = [
   "uselibpqcompat"
 ];
 
+function parseIntEnv(name: string, fallback: number, min = 0): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (Number.isNaN(value) || value < min) return fallback;
+  return value;
+}
+
+const pgPoolConfig = {
+  max: parseIntEnv("DATABASE_POOL_MAX", 6, 1),
+  idleTimeoutMillis: parseIntEnv("DATABASE_POOL_IDLE_TIMEOUT_MS", 10_000, 0),
+  connectionTimeoutMillis: parseIntEnv("DATABASE_POOL_CONNECTION_TIMEOUT_MS", 5_000, 0),
+  maxUses: parseIntEnv("DATABASE_POOL_MAX_USES", 7_500, 0)
+};
+
 function normalizeEnvMultiline(value: string): string {
   let normalized = value.trim();
   if (
@@ -73,7 +88,7 @@ function getSSLOptions(): object | undefined {
   return { ca: pem, rejectUnauthorized: true };
 }
 
-function createDb() {
+function createDb(): any {
   if (useNeon) {
     neonConfig.webSocketConstructor = WebSocket;
     return neonDrizzle(new NeonPool({ connectionString }));
@@ -84,9 +99,13 @@ function createDb() {
     : connectionString;
 
   return pgDrizzle(
-    new PgPool({ connectionString: pgConnectionString, ssl: sslOptions })
+    new PgPool({
+      connectionString: pgConnectionString,
+      ssl: sslOptions,
+      ...pgPoolConfig
+    })
   );
 }
 
-export const db = createDb();
+export const db: any = createDb();
 

@@ -45,6 +45,14 @@
 
 ## 2026-02-03
 
+- 修复 `/api/sync` 在大数据量下可能失败的问题：
+  - `auth_file_mappings` 与 `usage_records` 的批量写入改为分块执行，避免单条 SQL 过长或绑定参数过多。
+  - 新增分块配置：`AUTH_FILES_INSERT_CHUNK_SIZE`（默认 `500`）、`USAGE_INSERT_CHUNK_SIZE`（默认 `1000`）。
+
+- 修复 `pg` 驱动在小规格数据库下易触发 `53300`（连接槽耗尽）的问题：
+  - 为运行时 `pg.Pool` 增加可配置连接池参数：`DATABASE_POOL_MAX`、`DATABASE_POOL_IDLE_TIMEOUT_MS`、`DATABASE_POOL_CONNECTION_TIMEOUT_MS`、`DATABASE_POOL_MAX_USES`。
+  - 默认将池大小收敛为 `2`，降低 Vercel 多实例并发下打满数据库连接槽的风险。
+
 - 升级开发依赖（`eslint-config-next`、`@types/node`），提升开发体验。
 
 ## 2026-01-31
