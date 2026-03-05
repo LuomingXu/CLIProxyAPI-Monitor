@@ -499,8 +499,11 @@ export default function ExplorePage() {
     if (typeof window === 'undefined') return false;
     return window.localStorage.getItem('exploreFilterInvalidPoints') === 'true';
   });
+  // 统计行提示文字可见性，内容过长换行时自动隐藏
+  const [showHint, setShowHint] = useState(true);
   
   const scatterTooltipRef = useRef<ScatterTooltipHandle>(null);
+  const statsRowRef = useRef<HTMLDivElement>(null);
 
   // 持久化过滤无效点开关状态
   useEffect(() => {
@@ -646,6 +649,23 @@ export default function ExplorePage() {
   // 图例交互状态
   const [highlightedModel, setHighlightedModel] = useState<string | null>(null);
   const [hiddenModels, setHiddenModels] = useState<Set<string>>(new Set());
+
+  // 数据或筛选条件变化时重置提示文字可见性
+  useEffect(() => {
+    setShowHint(true);
+  }, [data?.total, data?.returned, zoomDomain, appliedRoute, appliedName, filterInvalidPoints]);
+
+  // 统计行高度超过单行阈值时隐藏提示文字
+  useEffect(() => {
+    if (!showHint) return;
+    const el = statsRowRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (el.offsetHeight > 44) setShowHint(false);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [showHint]);
 
   // 过滤后的点（排除隐藏的模型）
   const filteredPoints = useMemo(() => {
@@ -1691,7 +1711,7 @@ export default function ExplorePage() {
       </header>
 
       <section className="mt-6 rounded-2xl bg-slate-950/40 p-5 ring-1 ring-slate-800">
-        <div className="flex min-h-[28px] flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-300">
+        <div ref={statsRowRef} className="flex min-h-[28px] flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-300">
           <div>
             <span className="text-slate-400">总点数：</span>
             <span>{formatNumberWithCommas(data?.total ?? 0)}</span>
@@ -1813,7 +1833,7 @@ export default function ExplorePage() {
               </button>
               <span>模型堆叠分布图</span>
             </label>
-            <span className="text-xs text-slate-500">提示：拖拽框选可缩放区域</span>
+            {showHint && <span className="text-xs text-slate-500">提示：拖拽框选可缩放区域</span>}
           </div>
         </div>
 
