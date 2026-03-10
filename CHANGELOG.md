@@ -1,5 +1,89 @@
 # CHANGELOG
 
+## 2026-03-08
+
+- Explore 页模型图例排序方式现可在浏览器端记忆：
+  - 图例排序（首字母 / Token用量 / 请求次数）改为持久化到 `localStorage` 的 `exploreLegendSort`。
+  - 刷新页面或重新打开浏览器标签页后，会自动恢复上次选中的排序方式，避免每次都重新切换。
+
+- 修复 Explore 页时间范围与主图末尾日期不一致的问题：
+  - 后端探索明细查询移除默认 `limit(50000)` 截断，避免在高频数据下只返回时间范围前段记录、导致主图停在较早日期。
+  - 保留 `maxPoints` 参数能力，仅在显式传入时才限制返回条数。
+  - 前端在 Explore 明细点数超过 `20,000` 时默认关闭散点图开关，优先保证全量时间范围可见，同时降低大数据量下的 SVG 渲染压力。
+
+## 2026-03-07
+
+- 修复每小时负载分布堆叠图中"输入"与"缓存"重复计数的问题：
+  - 原始数据中 `inputTokens` 包含缓存命中部分，与 `cachedTokens` 存在子集重叠，导致堆叠图双重计数。
+  - 在 `hourlySeries` useMemo 输出前对每个数据点执行 `inputTokens = Math.max(0, inputTokens - cachedTokens)`，使两者在图中不重叠。
+  - 调整普通图和全屏图的堆叠顺序为：输入 → 缓存 → 输出 → 思考，保持"输入"与"缓存"在视觉上相邻，语义更清晰。
+  - 同步更新两个图的 tooltip 排序、图例排序，以及顶层圆角（`radius` 移至新顶层的思考柱）。
+
+- Tokens 卡片"缓存"改为缓存命中率显示，"输入"增加 hover 展示未命中输入：
+  - "缓存"行：默认标签"缓存命中率"及百分比，hover 切换为"缓存"及实际 token 数。
+  - "输入"行：默认标签"输入"及总输入 token 数，hover 切换为"未命中输入"及 `totalInputTokens - totalCachedTokens`。
+  - 两行均使用相同的 opacity 过渡动画（duration-200），`absolute` 覆盖层不影响布局。
+
+## 2026-03-06
+
+- 修复首页"无法加载实时用量："后内容为空的问题：
+  - HTTP/2 协议不携带 status text，`res.statusText` 在现代部署中始终为空字符串。
+  - 改为优先读取响应体 JSON 中的 `error` 字段，回退到 `res.statusText`，最终回退到 `HTTP ${res.status}`。
+  - `catch` 分支的 `error.message` 同样增加 `|| "未知错误"` 兜底。
+
+- Explore 页模型图例排序切换：
+  - 点击"模型图例"右侧的排序标签可循环切换：首字母 → Token用量 → 次数 → 首字母。
+  - 排序计算在 `ModelLegend` 组件内部维护（`legendSort` state + `sortedModels` useMemo），不影响外部状态。
+  - 新增 `modelStats` prop（由 `ExplorePage` 从 `points` 汇总 tokens / requests），在切换时无需重复遍历。
+
+- Explore 页模型图例颜色优化（方案B 系统整改）：
+  - 原 `MODEL_COLORS` 中5处色相/色调高度相似的颜色（浅蓝≈天青、浅红≈玫红、重复黄≈橙黄、浅绿≈绿、浅紫≈品红紫）影响图例区分度。
+  - 替换方案：
+    - 位置6 `#99e6ff`（浅蓝 200°）→ `#c0ff30`（柠绿 82°）
+    - 位置8 `#ffb3b3`（浅红   0°）→ `#40fff0`（青绿 177°）
+    - 位置11 `#ffe66d`（重复黄55°）→ `#ff50a0`（玫粉 340°）
+    - 位置16 `#b3f5b3`（浅绿 120°）→ `#40ffa0`（春绿 152°）
+    - 位置17 `#d9b3ff`（浅紫 280°）→ `#f050e8`（品红洋红 305°）
+  - 新颜色相邻最小色相差从 <5° 提升至 ≥15°，视觉区分度显著改善。
+
+## 2026-03-05
+
+- Records 页表头多列排序：
+  - 点击**未激活**列 → 插入头部成为主排序键（desc）；点击**已激活**列第二次 → 切换为 asc；第三次 → 从排序列表移除（`occurredAt` 列不允许移除，第三次循环回 desc）。
+  - 存在多个排序键时，表头箭头旁显示小数字标注优先级（₁₂₃...）；悬停显示操作提示。
+  - URL 参数改为 `sort=field:order,field:order` 格式，兼容旧 `sortField`+`sortOrder` 参数。
+  - 游标分页采用方案 A：以首个排序键（主键）+ id 作为游标，次级排序在每页内精确有序。
+  - 改动文件：`lib/queries/records.ts`（添加 `SortKey` 类型和 `getSortExpr` 辅助函数，`getUsageRecords` 接受 `sortKeys[]`）、`app/api/records/route.ts`（解析 `sort` 参数）、`app/records/page.tsx`（多键排序状态与交互）。
+
+- 首页饼图颜色分配方式优化：
+  - 原逻辑按模型在原始数组中的位置分配颜色，导致颜色与排名无关联。
+  - 改为按 tokens 降序排名为每个模型分配固定颜色索引（`pieColorIndexMap` useMemo），tokens最多的模型始终得到颜色表第一个颜色，依此类推；对饼图 `Cell` 和自定义图例均生效，普通视图和全屏视图保持一致。
+
+- 首页新增自动刷新功能：
+  - 在"刷新数据"按钮左侧新增"自动刷新"复选框及刷新频率下拉框（预设 30秒/1分钟/5分钟/10分钟/30分钟 + 自定义秒数输入）。
+  - 使用 `public/auto-refresh-worker.js` Web Worker 计时，后台标签页也不会被浏览器降频/休眠，计时精度不受影响。
+  - 刷新频率和自定义值持久化至 `localStorage`（`autoRefreshSettings`），页面刷新后自动恢复；自动刷新开关默认关闭，不自动恢复以避免意外刷新。
+
+- 同步超时时限从 60s 调整为 120s，支持 env 调节：
+  - 前后端统一使用 `NEXT_PUBLIC_SYNC_TIMEOUT_MS` 环境变量覆盖（毫秒，正整数），默认 120s。
+  - 后端（`app/api/sync/route.ts`）`USAGE_TIMEOUT_MS` 读取该变量；前端（`app/page.tsx`）`doSync` 默认参数读取该变量（构建时注入）。
+
+- `formatCompactNumber` 补充 B（十亿）级别支持：
+  - 值 ≥ 1,000,000,000 时显示为 `x.xxB`（保留两位小数），避免 Tokens 等超大数值停留在 `1500M` 等不直观格式。
+
+- 首页请求数卡片成功/失败数精简显示：
+  - 当成功数或失败数 ≥ 10000（超过 4 位）时，自动转为紧凑格式（如 12.3k），减少卡片文字溢出。
+  - 鼠标悬停时通过 `title` 属性展示完整整数，方便查看精确值。
+
+- 自动刷新 UI 精细优化：
+  - 改为扁平一体化按钮样式：开启时整体 emerald 配色，关闭时 slate 配色；频率选项区通过 `max-width` 过渡动画展开/收起，无条件渲染避免动画失效。
+  - 选择"自定义..."时频率下拉框收缩为仅显示箭头（选项文字颜色改透明），节省横向空间。
+  - 下拉选项深色模式下使用近白绿配色（`#d1fae5` 文字 / `#022c22` 背景），防止深色环境下文字不可见。
+  - 悬停自动刷新按钮时展示倒计时提示（如"30s 后刷新"），使用 `tickBaseTimeRef` + `tickIntervalMsRef` 精确计算剩余秒数；每次 tick 及开启时同步更新基准时间，确保倒计时始终准确。
+  - 修复倒计时 tooltip 被 `overflow-hidden` 容器裁切无法显示的问题：将 tooltip 移至外层 `relative` wrapper 内但置于 `overflow-hidden` div 之外。
+  - 频率展开区及自定义输入区动画改为纯 opacity 淡入淡出（`transition-opacity duration-200`），去除宽度滑动动画；隐藏时 `max-w-0` 即时折叠空间，opacity 为 0 时折叠不可见，视觉效果等同纯渐变。
+
+
 ## 2026-03-03
 
 - Explore API 移除抽样采样逻辑：

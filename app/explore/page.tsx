@@ -26,26 +26,26 @@ type ExploreResponse = {
 };
 
 // 高对比度明亮色卡 - 20 色高饱和高明度，确保各色间强区分
-// 按色相分布均匀，饱和度 70-90%，明度 55-75%，适配暗色主题
-// 排序优化：按 1,3,5,7,9,2,4,6,8,10 交叉排列，最大化相邻颜色差异
+// 按色相均匀分布，高饱和高明度，适配暗色主题；相邻色最大化色相差
+// REPLACED 5 near-duplicate pale colors with distinct-hue vivid alternatives
 const MODEL_COLORS = [
-  "#ff7a7aff", // 14 玫红 (345°)
-  "#ffe863ff", // 3 橙黄 (40°)
-  "#8df48dff", // 6 绿 (120°)
-  "#72afffff", // 9 蓝 (220°)
-  "#a582ff", // 11 紫 (270°)
-  "#99e6ff", // 19 浅蓝 (200°+)
-  "#ff76d1ff", // 13 品红 (320°)
-  "#ffb3b3", // 15 浅红 (0°+)
-  "#fff899", // 17 浅黄 (60°+)
-  "#ff8c42", // 2 橙红 (20°)
-  "#ffe66d", // 4 黄 (60°)
-  "#42c9f5", // 8 天青 (195°)
-  "#7d7aff", // 10 靛蓝 (245°)
-  "#d97aff", // 12 品红紫 (290°)
-  "#ffd699", // 16 浅橙 (40°+)
-  "#b3f5b3", // 18 浅绿 (120°+)
-  "#d9b3ff", // 20 浅紫 (280°+)
+  "#ff7a7aff", // 1  玫红  (345°)
+  "#ffe863ff", // 2  橙黄  ( 50°)
+  "#8df48dff", // 3  绿    (120°)
+  "#72afffff", // 4  蓝    (220°)
+  "#a582ff",   // 5  紫    (270°)
+  "#c0ff30",   // 6  柠绿  ( 82°)  ← was浅蓝200°
+  "#ff76d1ff", // 7  品红  (320°)
+  "#40fff0",   // 8  青绿  (177°)  ← was浅红  0°
+  "#fff899",   // 9  浅黄  ( 60°)
+  "#ff8c42",   // 10 橙红  ( 20°)
+  "#ff50a0",   // 11 玫粉  (340°)  ← was重复黄55°
+  "#42c9f5",   // 12 天青  (195°)
+  "#7d7aff",   // 13 靛蓝  (245°)
+  "#d97aff",   // 14 品红紫(290°)
+  "#ffd699",   // 15 浅橙  ( 40°)
+  "#40ffa0",   // 16 春绿  (152°)  ← was浅绿 120°
+  "#f050e8",   // 17 品红洋红(305°)← was浅紫 280°
 ];
 
 const TOKEN_COLORS = {
@@ -57,6 +57,7 @@ const TOKEN_COLORS = {
 
 const CHART_MARGIN = { top: 8, right: 12, left: 8, bottom: 12 };
 const CHART_TOP_INSET = 4;
+const AUTO_HIDE_SCATTER_THRESHOLD = 20_000;
 
 function clamp(num: number, min: number, max: number) {
   return Math.min(Math.max(num, min), max);
@@ -303,6 +304,22 @@ function Skeleton({ className }: { className?: string }) {
 // 独立的图例组件，使用 React.memo 避免不必要的重渲染
 import { memo } from "react";
 
+type LegendSort = "alpha" | "tokens" | "requests";
+const LEGEND_SORT_CYCLE: LegendSort[] = ["alpha", "tokens", "requests"];
+const LEGEND_SORT_LABELS: Record<LegendSort, string> = {
+  alpha: "首字母",
+  tokens: "Token用量",
+  requests: "请求次数",
+};
+const LEGEND_SORT_STORAGE_KEY = "exploreLegendSort";
+
+function parseLegendSort(raw: string | null): LegendSort {
+  if (raw === "tokens" || raw === "requests" || raw === "alpha") {
+    return raw;
+  }
+  return "alpha";
+}
+
 type ModelLegendProps = {
   models: string[];
   hiddenModels: Set<string>;
@@ -311,6 +328,7 @@ type ModelLegendProps = {
   onMouseLeave: () => void;
   onClick: (model: string) => void;
   onCtrlClick: (model: string) => void;
+  modelStats?: Map<string, { tokens: number; requests: number }>;
 };
 
 const ModelLegend = memo(function ModelLegend({
@@ -321,17 +339,52 @@ const ModelLegend = memo(function ModelLegend({
   onMouseLeave,
   onClick,
   onCtrlClick,
+  modelStats,
 }: ModelLegendProps) {
+  const [legendSort, setLegendSort] = useState<LegendSort>(() => {
+    if (typeof window === "undefined") return "alpha";
+    return parseLegendSort(window.localStorage.getItem(LEGEND_SORT_STORAGE_KEY));
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(LEGEND_SORT_STORAGE_KEY, legendSort);
+  }, [legendSort]);
+
+  const sortedModels = useMemo(() => {
+    if (legendSort === "tokens")
+      return [...models].sort((a, b) => (modelStats?.get(b)?.tokens ?? 0) - (modelStats?.get(a)?.tokens ?? 0));
+    if (legendSort === "requests")
+      return [...models].sort((a, b) => (modelStats?.get(b)?.requests ?? 0) - (modelStats?.get(a)?.requests ?? 0));
+    return [...models].sort((a, b) => a.localeCompare(b));
+  }, [models, legendSort, modelStats]);
+
   if (models.length === 0) return null;
+
+  const handleSortClick = () => {
+    const idx = LEGEND_SORT_CYCLE.indexOf(legendSort);
+    setLegendSort(LEGEND_SORT_CYCLE[(idx + 1) % LEGEND_SORT_CYCLE.length]);
+  };
   
   return (
     <div className="mt-3 rounded-xl bg-slate-900/30 p-3 ring-1 ring-slate-800">
-      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-300">
-        <span className="text-slate-400">模型图例（悬停高亮，点击隐藏，Ctrl + 点击单独显示）</span>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-300">
+        <button
+          type="button"
+          onClick={handleSortClick}
+          className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 transition-colors"
+          title="点击切换排序方式"
+        >
+          <span>模型图例</span>
+          <span className="rounded bg-slate-700/70 px-1 py-0.5 text-[10px] text-slate-400 hover:text-slate-300 transition-colors">
+            {LEGEND_SORT_LABELS[legendSort]} ↕
+          </span>
+        </button>
+        <span className="text-slate-500">（悬停高亮，点击隐藏，Ctrl + 点击单独显示）</span>
       </div>
       <div className="mt-2 max-h-20 overflow-auto pr-1">
         <div className="flex flex-wrap gap-x-4 gap-y-2 text-sm text-slate-300">
-          {models.map((m) => {
+          {sortedModels.map((m) => {
             const isHidden = hiddenModels.has(m);
             return (
               <button
@@ -463,8 +516,11 @@ export default function ExplorePage() {
     if (typeof window === 'undefined') return false;
     return window.localStorage.getItem('exploreFilterInvalidPoints') === 'true';
   });
+  // 统计行提示文字可见性，内容过长换行时自动隐藏
+  const [showHint, setShowHint] = useState(true);
   
   const scatterTooltipRef = useRef<ScatterTooltipHandle>(null);
+  const statsRowRef = useRef<HTMLDivElement>(null);
 
   // 持久化过滤无效点开关状态
   useEffect(() => {
@@ -610,6 +666,20 @@ export default function ExplorePage() {
   // 图例交互状态
   const [highlightedModel, setHighlightedModel] = useState<string | null>(null);
   const [hiddenModels, setHiddenModels] = useState<Set<string>>(new Set());
+
+  // 统计行高度超过单行阈值时隐藏提示文字，隐藏后直到刷新页面才再显示
+  useEffect(() => {
+    const el = statsRowRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (el.offsetHeight > 44) {
+        setShowHint(false);
+        ro.disconnect();
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // 过滤后的点（排除隐藏的模型）
   const filteredPoints = useMemo(() => {
@@ -1205,6 +1275,10 @@ export default function ExplorePage() {
 
         if (!cancelled) {
           setData(json);
+          const pointCount = json.points?.length ?? 0;
+          // 点数超过 5000 自动启用过滤无效点
+          if (pointCount > 5000) setFilterInvalidPoints(true);
+          setShowScatter(pointCount <= AUTO_HIDE_SCATTER_THRESHOLD);
           setAppliedDays(json.days ?? rangeDays);
           setRouteOptions(Array.from(new Set(json.filters?.routes ?? [])));
           setNameOptions(Array.from(new Set(json.filters?.names ?? [])));
@@ -1231,6 +1305,17 @@ export default function ExplorePage() {
       if (p.model) set.add(p.model);
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [points]);
+
+  // 各模型的 tokens / requests 汇总，供图例排序使用
+  const modelStats = useMemo(() => {
+    const map = new Map<string, { tokens: number; requests: number }>();
+    for (const p of points) {
+      if (!p.model) continue;
+      const cur = map.get(p.model) ?? { tokens: 0, requests: 0 };
+      map.set(p.model, { tokens: cur.tokens + (p.tokens ?? 0), requests: cur.requests + 1 });
+    }
+    return map;
   }, [points]);
 
   const isUsingGlobalRange = selectionSource === "global";
@@ -1641,7 +1726,7 @@ export default function ExplorePage() {
       </header>
 
       <section className="mt-6 rounded-2xl bg-slate-950/40 p-5 ring-1 ring-slate-800">
-        <div className="flex min-h-[28px] flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-300">
+        <div ref={statsRowRef} className="flex min-h-[28px] flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-300">
           <div>
             <span className="text-slate-400">总点数：</span>
             <span>{formatNumberWithCommas(data?.total ?? 0)}</span>
@@ -1763,7 +1848,7 @@ export default function ExplorePage() {
               </button>
               <span>模型堆叠分布图</span>
             </label>
-            <span className="text-xs text-slate-500">提示：拖拽框选可缩放区域</span>
+            {showHint && <span className="text-xs text-slate-500">提示：拖拽框选可缩放区域</span>}
           </div>
         </div>
 
@@ -1775,6 +1860,7 @@ export default function ExplorePage() {
           onMouseLeave={handleLegendMouseLeave}
           onClick={handleLegendClick}
           onCtrlClick={handleLegendCtrlClickWithModels}
+          modelStats={modelStats}
         />
 
         <div className="mt-4 flex h-[75vh] flex-col gap-0">

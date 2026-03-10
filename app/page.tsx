@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef, startTransition, type FormEvent } from "react";
 import { ResponsiveContainer, LineChart, Line, Area, CartesianGrid, XAxis, YAxis, Tooltip, BarChart, Bar, Legend, ComposedChart, PieChart, Pie, Cell } from "recharts";
 import { formatCurrency, formatNumber, formatCompactNumber, formatNumberWithCommas, formatHourLabel } from "@/lib/utils";
-import { AlertTriangle, Info, LucideIcon, Activity, Save, RefreshCw, Moon, Sun, Pencil, Trash2, Maximize2, CalendarRange, X, DollarSign, Search } from "lucide-react";
+import { AlertTriangle, Info, LucideIcon, Activity, Save, RefreshCw, Moon, Sun, Pencil, Trash2, Maximize2, CalendarRange, X, DollarSign, Search, ChevronDown } from "lucide-react";
 import type { ModelPrice, UsageOverview, UsageSeriesPoint } from "@/lib/types";
 import { Modal } from "@/app/components/Modal";
 
@@ -27,6 +27,7 @@ type OverviewAPIResponse = {
   empty: boolean;
   days: number;
   timezone?: string;
+  lastSyncAt?: string | null;
   meta?: OverviewMeta;
   filters?: { models: string[]; routes: string[]; names: string[] };
 };
@@ -47,6 +48,8 @@ const hourFormatter = new Intl.DateTimeFormat("en-CA", {
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// 可通过 NEXT_PUBLIC_SYNC_TIMEOUT_MS 环境变量调节（毫秒），默认 120 秒
+const SYNC_CLIENT_TIMEOUT_MS = Number(process.env.NEXT_PUBLIC_SYNC_TIMEOUT_MS) || 120_000;
 
 function formatDateInputValue(date: Date) {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -226,6 +229,18 @@ export default function DashboardPage() {
     details?: { model: string; status: string; reason?: string; matchedWith?: string }[];
     error?: string;
   } | null>(null);
+
+  // 自动刷新状态
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [refreshPreset, setRefreshPreset] = useState("60"); // "60"|"300"|"900"|"1800"|"3600"|"custom"
+  const [customIntervalInput, setCustomIntervalInput] = useState("60");
+  const [customIntervalUnit, setCustomIntervalUnit] = useState<"s" | "m">("s");
+  const autoRefreshWorkerRef = useRef<Worker | null>(null);
+  const tickBaseTimeRef = useRef(0);
+  const tickIntervalMsRef = useRef(60000);
+  const [showCountdownTip, setShowCountdownTip] = useState(false);
+  const [countdownText, setCountdownText] = useState("");
+  const hoverCountdownTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -499,7 +514,7 @@ export default function DashboardPage() {
   }, []);
 
   // 执行数据同步
-  const doSync = useCallback(async (showMessage = true, triggerRefresh = true, timeout = 60000) => {
+  const doSync = useCallback(async (showMessage = true, triggerRefresh = true, timeout = SYNC_CLIENT_TIMEOUT_MS) => {
     if (syncingRef.current) return;
     syncingRef.current = true;
     setSyncing(true);
@@ -675,6 +690,64 @@ export default function DashboardPage() {
     applyTheme(initial);
   }, [applyTheme]);
 
+  // 恢复自动刷新设置
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = window.localStorage.getItem("autoRefreshSettings");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.preset) setRefreshPreset(parsed.preset);
+        if (parsed.custom) setCustomIntervalInput(parsed.custom);
+        if (parsed.unit === "m") setCustomIntervalUnit("m");
+      } catch {}
+    }
+  }, []);
+
+  // 保存自动刷新设置（不保存 autoRefresh 开关状态，避免意外刷新）
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("autoRefreshSettings", JSON.stringify({
+      preset: refreshPreset,
+      custom: customIntervalInput,
+      unit: customIntervalUnit,
+    }));
+  }, [refreshPreset, customIntervalInput, customIntervalUnit]);
+
+  // 自动刷新 Worker - 组件挂载时预加载，避免点击时新建 Worker 卡顿
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof Worker === "undefined") return;
+    const worker = new Worker("/auto-refresh-worker.js");
+    autoRefreshWorkerRef.current = worker;
+    worker.onmessage = (e: MessageEvent) => {
+      if (e.data.type === "tick") {
+        tickBaseTimeRef.current = Date.now();
+        doSync(true);
+      }
+    };
+    return () => {
+      worker.postMessage({ type: "stop" });
+      worker.terminate();
+      autoRefreshWorkerRef.current = null;
+    };
+  }, [doSync]);
+
+  // 根据 autoRefresh 开关和间隔设置向 Worker 发送 start/stop
+  useEffect(() => {
+    const worker = autoRefreshWorkerRef.current;
+    if (!worker) return;
+    if (autoRefresh) {
+      const intervalMs = refreshPreset === "custom"
+        ? Math.max(customIntervalUnit === "m" ? 1 : 5, Number(customIntervalInput) || (customIntervalUnit === "m" ? 1 : 60)) * (customIntervalUnit === "m" ? 60_000 : 1000)
+        : Number(refreshPreset) * 1000;
+      tickIntervalMsRef.current = intervalMs;
+      tickBaseTimeRef.current = Date.now();
+      worker.postMessage({ type: "start", interval: intervalMs });
+    } else {
+      worker.postMessage({ type: "stop" });
+    }
+  }, [autoRefresh, refreshPreset, customIntervalInput, customIntervalUnit]);
+
   useEffect(() => {
     if (!customPickerOpen) return;
     const handleClickOutside = (event: MouseEvent) => {
@@ -720,7 +793,14 @@ export default function DashboardPage() {
 
         if (!res.ok) {
           if (active) {
-            setOverviewError("无法加载实时用量：" + res.statusText);
+            let errMsg: string;
+            try {
+              const errBody = await res.json();
+              errMsg = errBody?.error || res.statusText || `HTTP ${res.status}`;
+            } catch {
+              errMsg = res.statusText || `HTTP ${res.status}`;
+            }
+            setOverviewError("无法加载实时用量：" + errMsg);
             setOverview(null);
           }
           return;
@@ -736,11 +816,17 @@ export default function DashboardPage() {
         setRouteOptions(Array.from(new Set(data.filters?.routes ?? [])));
         setNameOptions(Array.from(new Set(data.filters?.names ?? [])));
         setAppliedDays(data.days ?? rangeDays);
+        if (data.lastSyncAt) {
+          const dbTime = new Date(data.lastSyncAt);
+          if (Number.isFinite(dbTime.getTime())) {
+            setLastSyncTime((prev) => (!prev || dbTime > prev ? dbTime : prev));
+          }
+        }
       } catch (err) {
         if (!active) return;
         const error = err as Error;
         if ((error as any)?.name === "AbortError") return;
-        setOverviewError("无法加载实时用量：" + error.message);
+        setOverviewError("无法加载实时用量：" + (error.message || "未知错误"));
         setOverview(null);
       } finally {
         if (active) setLoadingOverview(false);
@@ -758,9 +844,14 @@ export default function DashboardPage() {
   
   const hourlySeries = useMemo(() => {
     if (!overviewData?.byHour) return [] as UsageSeriesPoint[];
-    if (hourRange === "all") return overviewData.byHour;
-    const hours = hourRange === "24h" ? 24 : 72;
-    return buildHourlySeries(overviewData.byHour, hours, bucketTimezone);
+    const raw = hourRange === "all"
+      ? overviewData.byHour
+      : buildHourlySeries(overviewData.byHour, hourRange === "24h" ? 24 : 72, bucketTimezone);
+    // 输入仅计未命中缓存部分，避免与缓存字段在堆叠图中重复计数
+    return raw.map(p => ({
+      ...p,
+      inputTokens: Math.max(0, (p.inputTokens ?? 0) - (p.cachedTokens ?? 0))
+    }));
   }, [hourRange, overviewData?.byHour, bucketTimezone]);
 
   const hourlyLineStyle = useMemo(
@@ -823,6 +914,14 @@ export default function DashboardPage() {
   const sortedModelsByCost = useMemo(() => {
     const models = overviewData?.models ?? [];
     return [...models].sort((a, b) => b.cost - a.cost);
+  }, [overviewData]);
+
+  // 按 tokens 降序为每个模型分配固定颜色索引，排名越高颜色越靠前
+  const pieColorIndexMap = useMemo(() => {
+    const models = overviewData?.models ?? [];
+    return new Map(
+      [...models].sort((a, b) => b.tokens - a.tokens).map((m, i) => [m.model, i])
+    );
   }, [overviewData]);
 
   // 计算实际数据时长（从最早记录到现在）
@@ -1065,6 +1164,132 @@ export default function DashboardPage() {
           >
             {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
           </button>
+          {/* 自动刷新控件 - 扁平一体化 */}
+          <div className="relative">
+            <span className={`pointer-events-none absolute -top-8 left-1/2 -translate-x-1/2 whitespace-nowrap rounded px-2 py-0.5 text-xs z-50 transition-opacity duration-150 ${
+              darkMode ? "bg-slate-700 text-emerald-200" : "bg-slate-800 text-emerald-100"
+            } ${showCountdownTip ? "opacity-100" : "opacity-0"}`}>
+              下次刷新: {countdownText}
+            </span>
+          <div className={`flex items-center rounded-lg border text-sm font-medium overflow-hidden transition-colors duration-200 ${
+            autoRefresh
+              ? darkMode
+                ? "border-emerald-500/40 bg-emerald-600/15"
+                : "border-emerald-400/60 bg-emerald-50"
+              : darkMode
+                ? "border-slate-700 bg-slate-800 hover:border-slate-500"
+                : "border-slate-300 bg-white hover:border-slate-400"
+          }`}>
+            <button
+              type="button"
+              onClick={() => setAutoRefresh((v) => !v)}
+              onMouseEnter={() => {
+                if (!autoRefresh) return;
+                const update = () => {
+                  const elapsed = Date.now() - tickBaseTimeRef.current;
+                  const remaining = Math.max(0, tickIntervalMsRef.current - elapsed);
+                  const secs = Math.ceil(remaining / 1000);
+                  setCountdownText(secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`);
+                };
+                update();
+                setShowCountdownTip(true);
+                hoverCountdownTimerRef.current = window.setInterval(update, 500);
+              }}
+              onMouseLeave={() => {
+                setShowCountdownTip(false);
+                if (hoverCountdownTimerRef.current !== null) {
+                  clearInterval(hoverCountdownTimerRef.current);
+                  hoverCountdownTimerRef.current = null;
+                }
+              }}
+              className={`flex items-center gap-1.5 px-3 py-1.5 transition-colors ${
+                autoRefresh
+                  ? darkMode ? "text-emerald-400" : "text-emerald-600"
+                  : darkMode ? "text-slate-300" : "text-slate-700"
+              }`}
+            >
+              <span className={`inline-block h-2 w-2 rounded-full border-2 flex-shrink-0 transition-all duration-200 ${
+                autoRefresh
+                  ? "border-emerald-400 bg-emerald-400"
+                  : darkMode ? "border-slate-500" : "border-slate-400"
+              }`} />
+              自动刷新
+            </button>
+            {/* 频率选择器 - 仅淡入淡出 */}
+            <div className={`flex items-center overflow-hidden transition-opacity duration-200 ${
+              autoRefresh ? "opacity-100" : "opacity-0 pointer-events-none max-w-0"
+            }`}>
+              <div className={`w-px self-stretch my-1 flex-shrink-0 ${
+                darkMode ? "bg-emerald-500/30" : "bg-emerald-300/60"
+              }`} />
+              <div className={`relative flex items-center flex-shrink-0 overflow-hidden ${
+                refreshPreset === "custom" ? "max-w-6" : "max-w-44"
+              }`}>
+                <select
+                  value={refreshPreset}
+                  onChange={(e) => setRefreshPreset(e.target.value)}
+                  className={`appearance-none py-1.5 pl-2 text-xs outline-none cursor-pointer ${
+                    refreshPreset === "custom" ? "pr-4" : "pr-6"
+                  } ${
+                    darkMode ? "text-emerald-300" : "text-emerald-700"
+                  }`}
+                  style={{
+                    backgroundColor: "transparent",
+                    color: refreshPreset === "custom" ? "transparent" : undefined,
+                  }}
+                >
+                  <option value="60" style={{ backgroundColor: darkMode ? "#022c22" : "#fff", color: darkMode ? "#d1fae5" : "#064e3b" }}>1 分钟</option>
+                  <option value="300" style={{ backgroundColor: darkMode ? "#022c22" : "#fff", color: darkMode ? "#d1fae5" : "#064e3b" }}>5 分钟</option>
+                  <option value="900" style={{ backgroundColor: darkMode ? "#022c22" : "#fff", color: darkMode ? "#d1fae5" : "#064e3b" }}>15 分钟</option>
+                  <option value="1800" style={{ backgroundColor: darkMode ? "#022c22" : "#fff", color: darkMode ? "#d1fae5" : "#064e3b" }}>30 分钟</option>
+                  <option value="3600" style={{ backgroundColor: darkMode ? "#022c22" : "#fff", color: darkMode ? "#d1fae5" : "#064e3b" }}>60 分钟</option>
+                  <option value="custom" style={{ backgroundColor: darkMode ? "#022c22" : "#fff", color: darkMode ? "#d1fae5" : "#064e3b" }}>自定义...</option>
+                </select>
+                <ChevronDown className={`absolute right-1 h-3 w-3 pointer-events-none ${
+                  darkMode ? "text-emerald-400" : "text-emerald-600"
+                }`} />
+              </div>
+              {/* 自定义输入 - 仅淡入淡出 */}
+              <div className={`flex items-center overflow-hidden transition-opacity duration-200 ${
+                refreshPreset === "custom" ? "opacity-100" : "opacity-0 pointer-events-none max-w-0"
+              }`}>
+                <div className={`w-px self-stretch my-1 flex-shrink-0 ${
+                  darkMode ? "bg-emerald-500/30" : "bg-emerald-300/60"
+                }`} />
+                <input
+                  type="number"
+                  min={customIntervalUnit === "m" ? "1" : "5"}
+                  value={customIntervalInput}
+                  onChange={(e) => setCustomIntervalInput(e.target.value)}
+                  className={`w-14 py-1.5 pl-2 pr-1 text-xs outline-none flex-shrink-0 appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${
+                    darkMode ? "text-emerald-300" : "text-emerald-700"
+                  }`}
+                  style={{ backgroundColor: "transparent" }}
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (customIntervalUnit === "s") {
+                      const mins = Math.max(1, Math.floor((Number(customIntervalInput) || 60) / 60));
+                      setCustomIntervalInput(String(mins));
+                      setCustomIntervalUnit("m");
+                    } else {
+                      const secs = Math.min(3600, (Number(customIntervalInput) || 1) * 60);
+                      setCustomIntervalInput(String(secs));
+                      setCustomIntervalUnit("s");
+                    }
+                  }}
+                  className={`pr-2 text-xs flex-shrink-0 cursor-pointer transition-colors ${
+                    darkMode ? "text-emerald-400 hover:text-emerald-300" : "text-emerald-600 hover:text-emerald-700"
+                  }`}
+                  title="点击切换秒/分"
+                >
+                  {customIntervalUnit === "s" ? "秒" : "分"}
+                </button>
+              </div>
+            </div>
+          </div>
+          </div>
           <button
             onClick={() => doSync(true)}
             disabled={syncing}
@@ -1315,9 +1540,19 @@ export default function DashboardPage() {
                 ) : null}
               </div>
               <p className="mt-2 text-sm">
-                <span className="text-emerald-400">✓ {overviewData.successCount}</span>
+                <span
+                  className="text-emerald-400"
+                  title={overviewData.successCount >= 10000 ? formatNumberWithCommas(overviewData.successCount) : undefined}
+                >
+                  ✓ {overviewData.successCount >= 10000 ? formatCompactNumber(overviewData.successCount) : overviewData.successCount}
+                </span>
                 <span className={`mx-2 ${darkMode ? "text-slate-500" : "text-slate-400"}`}>|</span>
-                <span className="text-red-400">✗ {overviewData.failureCount}</span>
+                <span
+                  className="text-red-400"
+                  title={overviewData.failureCount >= 10000 ? formatNumberWithCommas(overviewData.failureCount) : undefined}
+                >
+                  ✗ {overviewData.failureCount >= 10000 ? formatCompactNumber(overviewData.failureCount) : overviewData.failureCount}
+                </span>
               </p>
             </div>
             
@@ -1333,9 +1568,17 @@ export default function DashboardPage() {
                 </div>
               </div>
               <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-                <div className="flex items-center justify-between">
-                  <span className={darkMode ? "text-slate-400" : "text-slate-500"}>输入</span>
-                  <span className="font-medium" style={{ color: darkMode ? "#fb7185" : "#e11d48" }}>{formatNumberWithCommas(overviewData.totalInputTokens)}</span>
+                <div className="flex items-center justify-between group cursor-default">
+                  <span className={`relative ${darkMode ? "text-slate-400" : "text-slate-500"}`}>
+                    <span className="transition-opacity duration-200 group-hover:opacity-0 select-none">输入</span>
+                    <span className="absolute left-0 top-0 whitespace-nowrap opacity-0 transition-opacity duration-200 group-hover:opacity-100">未命中输入</span>
+                  </span>
+                  <span className="relative font-medium" style={{ color: darkMode ? "#fb7185" : "#e11d48" }}>
+                    <span className="transition-opacity duration-200 group-hover:opacity-0 select-none">{formatNumberWithCommas(overviewData.totalInputTokens)}</span>
+                    <span className="absolute right-0 top-0 whitespace-nowrap opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                      {formatNumberWithCommas(Math.max(0, overviewData.totalInputTokens - overviewData.totalCachedTokens))}
+                    </span>
+                  </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className={darkMode ? "text-slate-400" : "text-slate-500"}>输出</span>
@@ -1345,9 +1588,21 @@ export default function DashboardPage() {
                   <span className={darkMode ? "text-slate-400" : "text-slate-500"}>思考</span>
                   <span className="font-medium" style={{ color: darkMode ? "#fbbf24" : "#d97706" }}>{formatNumberWithCommas(overviewData.totalReasoningTokens)}</span>
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className={darkMode ? "text-slate-400" : "text-slate-500"}>缓存</span>
-                  <span className="font-medium" style={{ color: darkMode ? "#c084fc" : "#9333ea" }}>{formatNumberWithCommas(overviewData.totalCachedTokens)}</span>
+                <div className="flex items-center justify-between group cursor-default">
+                  <span className={`relative ${darkMode ? "text-slate-400" : "text-slate-500"}`}>
+                    <span className="transition-opacity duration-200 group-hover:opacity-0 select-none">缓存命中率</span>
+                    <span className="absolute left-0 top-0 whitespace-nowrap opacity-0 transition-opacity duration-200 group-hover:opacity-100">缓存</span>
+                  </span>
+                  <span className="relative font-medium" style={{ color: darkMode ? "#c084fc" : "#9333ea" }}>
+                    <span className="transition-opacity duration-200 group-hover:opacity-0 select-none">
+                      {overviewData.totalInputTokens > 0
+                        ? `${((overviewData.totalCachedTokens / overviewData.totalInputTokens) * 100).toFixed(2)}%`
+                        : "0.00%"}
+                    </span>
+                    <span className="absolute right-0 top-0 whitespace-nowrap opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                      {formatNumberWithCommas(overviewData.totalCachedTokens)}
+                    </span>
+                  </span>
                 </div>
               </div>
             </div>
@@ -1587,10 +1842,10 @@ export default function DashboardPage() {
                           setPieTooltipOpen(false);
                         }}
                       >
-                        {overviewData.models.map((_, index) => (
+                        {overviewData.models.map((m, index) => (
                           <Cell 
                             key={`cell-${index}`} 
-                            fill={PIE_COLORS[index % PIE_COLORS.length]}
+                            fill={PIE_COLORS[(pieColorIndexMap.get(m.model) ?? index) % PIE_COLORS.length]}
                             fillOpacity={hoveredPieIndex === null || hoveredPieIndex === index ? 1 : 0.3}
                             style={{ transition: 'fill-opacity 0.2s' }}
                           />
@@ -1662,8 +1917,8 @@ export default function DashboardPage() {
                                 isHighlighted && hoveredPieIndex === originalIndex ? 'ring-2 ring-offset-1' : ''
                               }`}
                               style={{ 
-                                backgroundColor: PIE_COLORS[originalIndex % PIE_COLORS.length],
-                                '--tw-ring-color': isHighlighted && hoveredPieIndex === originalIndex ? PIE_COLORS[originalIndex % PIE_COLORS.length] : 'transparent',
+                                backgroundColor: PIE_COLORS[(pieColorIndexMap.get(item.model) ?? originalIndex) % PIE_COLORS.length],
+                                '--tw-ring-color': isHighlighted && hoveredPieIndex === originalIndex ? PIE_COLORS[(pieColorIndexMap.get(item.model) ?? originalIndex) % PIE_COLORS.length] : 'transparent',
                                 transform: isHighlighted && hoveredPieIndex === originalIndex ? 'scale(1.2)' : 'scale(1)'
                               } as React.CSSProperties} 
                             />
@@ -1842,9 +2097,9 @@ export default function DashboardPage() {
                   />
                   {/* 堆积柱状图 - 柔和配色，仅顶部圆角，增强动画 */}
                   <Bar hide={!hourlyVisible.inputTokens} yAxisId="right" dataKey="inputTokens" name="输入" stackId="tokens" fill="url(#gradInput)" fillOpacity={0.8} animationDuration={600} barSize={24} />
+                  <Bar hide={!hourlyVisible.cachedTokens} yAxisId="right" dataKey="cachedTokens" name="缓存" stackId="tokens" fill="url(#gradCached)" fillOpacity={0.8} animationDuration={600} barSize={24} />
                   <Bar hide={!hourlyVisible.outputTokens} yAxisId="right" dataKey="outputTokens" name="输出" stackId="tokens" fill="url(#gradOutput)" fillOpacity={0.8} animationDuration={600} barSize={24} />
-                  <Bar hide={!hourlyVisible.reasoningTokens} yAxisId="right" dataKey="reasoningTokens" name="思考" stackId="tokens" fill="url(#gradReasoning)" fillOpacity={0.8} animationDuration={600} barSize={24} />
-                  <Bar hide={!hourlyVisible.cachedTokens} yAxisId="right" dataKey="cachedTokens" name="缓存" stackId="tokens" fill="url(#gradCached)" fillOpacity={0.8} radius={[4, 4, 0, 0]} animationDuration={600} barSize={24} />
+                  <Bar hide={!hourlyVisible.reasoningTokens} yAxisId="right" dataKey="reasoningTokens" name="思考" stackId="tokens" fill="url(#gradReasoning)" fillOpacity={0.8} radius={[4, 4, 0, 0]} animationDuration={600} barSize={24} />
                   {/* 曲线在最上层 - 带描边突出显示 */}
                   <Line 
                     hide={!hourlyVisible.requests}
@@ -1923,7 +2178,7 @@ export default function DashboardPage() {
                 <Search className={`absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 ${darkMode ? "text-slate-500" : "text-slate-400"}`} />
                 <input
                   type="text"
-                  placeholder="搜索已配置的模型..."
+                  placeholder="搜索已配置价格的模型..."
                   value={priceSearchQuery}
                   onChange={(e) => setPriceSearchQuery(e.target.value)}
                   className={`w-full rounded-lg border py-2 pl-10 pr-3 text-sm focus:border-indigo-500 focus:outline-none ${darkMode ? "border-slate-700 bg-slate-900 text-white placeholder-slate-500" : "border-slate-300 bg-white text-slate-900 placeholder-slate-400"}`}
@@ -2333,10 +2588,10 @@ export default function DashboardPage() {
                           setPieTooltipOpen(false);
                         }}
                       >
-                        {overviewData.models.map((_, index) => (
+                        {overviewData.models.map((m, index) => (
                           <Cell 
                             key={`cell-fs-${index}`} 
-                            fill={PIE_COLORS[index % PIE_COLORS.length]}
+                            fill={PIE_COLORS[(pieColorIndexMap.get(m.model) ?? index) % PIE_COLORS.length]}
                             fillOpacity={hoveredPieIndex === null || hoveredPieIndex === index ? 1 : 0.3}
                             style={{ transition: 'fill-opacity 0.2s' }}
                           />
@@ -2408,8 +2663,8 @@ export default function DashboardPage() {
                                 isHighlighted && hoveredPieIndex === originalIndex ? 'ring-2 ring-offset-1' : ''
                               }`}
                               style={{ 
-                                backgroundColor: PIE_COLORS[originalIndex % PIE_COLORS.length],
-                                '--tw-ring-color': isHighlighted && hoveredPieIndex === originalIndex ? PIE_COLORS[originalIndex % PIE_COLORS.length] : 'transparent',
+                                backgroundColor: PIE_COLORS[(pieColorIndexMap.get(item.model) ?? originalIndex) % PIE_COLORS.length],
+                                '--tw-ring-color': isHighlighted && hoveredPieIndex === originalIndex ? PIE_COLORS[(pieColorIndexMap.get(item.model) ?? originalIndex) % PIE_COLORS.length] : 'transparent',
                                 transform: isHighlighted && hoveredPieIndex === originalIndex ? 'scale(1.2)' : 'scale(1)'
                               } as React.CSSProperties}
                             />
@@ -2549,9 +2804,9 @@ export default function DashboardPage() {
                       const keyMap: Record<string, string> = {
                         "请求数": "requests",
                         "输入": "inputTokens",
+                        "缓存": "cachedTokens",
                         "输出": "outputTokens",
-                        "思考": "reasoningTokens",
-                        "缓存": "cachedTokens"
+                        "思考": "reasoningTokens"
                       };
                       const key = keyMap[value];
                       const isVisible = hourlyVisible[key];
@@ -2563,9 +2818,9 @@ export default function DashboardPage() {
                       const colors: Record<string, string> = {
                         "请求数": darkMode ? "#60a5fa" : "#3b82f6",
                         "输入": darkMode ? "#fb7185" : "#e11d48",
+                        "缓存": darkMode ? "#c084fc" : "#9333ea",
                         "输出": darkMode ? "#4ade80" : "#16a34a",
-                        "思考": darkMode ? "#fbbf24" : "#d97706",
-                        "缓存": darkMode ? "#c084fc" : "#9333ea"
+                        "思考": darkMode ? "#fbbf24" : "#d97706"
                       };
                       return <span style={{ color: colors[value] || "inherit", fontWeight: 500 }} title="按住 Ctrl 点击可只显示该项">{value}</span>;
                     }}
@@ -2582,16 +2837,16 @@ export default function DashboardPage() {
                   {fullscreenHourlyMode === "area" ? (
                     <>
                       <Area hide={!hourlyVisible.inputTokens} yAxisId="right" dataKey="inputTokens" name="输入" stackId="tokens" type="monotone" stroke="#fca5a5" fill="url(#gradInputFS)" fillOpacity={0.35} animationDuration={600} />
+                      <Area hide={!hourlyVisible.cachedTokens} yAxisId="right" dataKey="cachedTokens" name="缓存" stackId="tokens" type="monotone" stroke="#c084fc" fill="url(#gradCachedFS)" fillOpacity={0.35} animationDuration={600} />
                       <Area hide={!hourlyVisible.outputTokens} yAxisId="right" dataKey="outputTokens" name="输出" stackId="tokens" type="monotone" stroke="#4ade80" fill="url(#gradOutputFS)" fillOpacity={0.35} animationDuration={600} />
                       <Area hide={!hourlyVisible.reasoningTokens} yAxisId="right" dataKey="reasoningTokens" name="思考" stackId="tokens" type="monotone" stroke="#fbbf24" fill="url(#gradReasoningFS)" fillOpacity={0.35} animationDuration={600} />
-                      <Area hide={!hourlyVisible.cachedTokens} yAxisId="right" dataKey="cachedTokens" name="缓存" stackId="tokens" type="monotone" stroke="#c084fc" fill="url(#gradCachedFS)" fillOpacity={0.35} animationDuration={600} />
                     </>
                   ) : (
                     <>
                       <Bar hide={!hourlyVisible.inputTokens} yAxisId="right" dataKey="inputTokens" name="输入" stackId="tokens" fill="url(#gradInputFS)" fillOpacity={0.8} animationDuration={600} barSize={32} />
-                      <Bar hide={!hourlyVisible.outputTokens} yAxisId="right" dataKey="outputTokens" name="输出" stackId="tokens" fill="url(#gradOutputFS)" fillOpacity={0.8} animationDuration={600} barSize={32} />
-                      <Bar hide={!hourlyVisible.reasoningTokens} yAxisId="right" dataKey="reasoningTokens" name="思考" stackId="tokens" fill="url(#gradReasoningFS)" fillOpacity={0.8} animationDuration={600} barSize={32} />
                       <Bar hide={!hourlyVisible.cachedTokens} yAxisId="right" dataKey="cachedTokens" name="缓存" stackId="tokens" fill="url(#gradCachedFS)" fillOpacity={0.8} animationDuration={600} barSize={32} />
+                      <Bar hide={!hourlyVisible.outputTokens} yAxisId="right" dataKey="outputTokens" name="输出" stackId="tokens" fill="url(#gradOutputFS)" fillOpacity={0.8} animationDuration={600} barSize={32} />
+                      <Bar hide={!hourlyVisible.reasoningTokens} yAxisId="right" dataKey="reasoningTokens" name="思考" stackId="tokens" fill="url(#gradReasoningFS)" fillOpacity={0.8} radius={[4, 4, 0, 0]} animationDuration={600} barSize={32} />
                     </>
                   )}
                   {/* 曲线在最上层 - 带描边突出显示 */}

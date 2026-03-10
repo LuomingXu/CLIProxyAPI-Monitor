@@ -40,8 +40,7 @@ function withDayEnd(date: Date) {
 }
 
 function normalizeMaxPoints(value?: number | null) {
-  const fallback = 50_000;
-  if (value == null || Number.isNaN(value)) return fallback;
+  if (value == null || Number.isNaN(value)) return null;
   return Math.min(Math.max(Math.floor(value), 1_000), 100_000);
 }
 
@@ -138,7 +137,7 @@ export async function getExplorePoints(
 
   // 直接按时间排序查询，不再使用 row_number() 抽样；默认在 SQL 层过滤 tokens=0 的无效点
   const pointsWhere = shouldFilterInvalid ? and(...whereParts, sql`${usageRecords.totalTokens} != 0`) : where;
-  const points: Array<{ ts: number; tokens: number; inputTokens: number; outputTokens: number; reasoningTokens: number; cachedTokens: number; model: string }> = await db
+  let pointsQuery: any = db
     .select({
       ts: sql<number>`(extract(epoch from ${usageRecords.occurredAt}) * 1000)::bigint`,
       tokens: sql<number>`${usageRecords.totalTokens}`,
@@ -150,8 +149,13 @@ export async function getExplorePoints(
     })
     .from(usageRecords)
     .where(pointsWhere)
-    .orderBy(usageRecords.occurredAt)
-    .limit(maxPoints);
+    .orderBy(usageRecords.occurredAt);
+
+  if (maxPoints != null) {
+    pointsQuery = pointsQuery.limit(maxPoints);
+  }
+
+  const points: Array<{ ts: number; tokens: number; inputTokens: number; outputTokens: number; reasoningTokens: number; cachedTokens: number; model: string }> = await pointsQuery;
 
   return {
     days,
